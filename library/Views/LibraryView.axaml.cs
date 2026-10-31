@@ -130,7 +130,9 @@ public partial class LibraryView : UserControl
                 _searchTimer.Stop();
                 _searchTimer.Start();
             }
-            else if (e.PropertyName == nameof(LibraryViewModel.HideExtras))
+            else if (e.PropertyName is nameof(LibraryViewModel.HideGames)
+                     or nameof(LibraryViewModel.HideUpdates)
+                     or nameof(LibraryViewModel.HideDlcs))
                 ApplyFilter();
             else if (e.PropertyName == nameof(LibraryViewModel.SequentialMode))
                 RefreshReorderFlags();
@@ -211,6 +213,7 @@ public partial class LibraryView : UserControl
             _ = AutoDetectAsync();
         }
         this.FindControl<Button>("BtnAddDrive").Click += async (_, _) => await AddDriveAsync();
+        this.FindControl<Button>("BtnClearLibrary").Click += async (_, _) => await ClearLibraryAsync();
         this.FindControl<Button>("BtnTest").Click += async (_, _) => await TestConnectionAsync();
         this.FindControl<Button>("BtnScan").Click += async (_, _) => await ScanFoldersAsync();
         this.FindControl<Button>("BtnSend").Click += (_, _) => EnqueuePkgs();
@@ -226,6 +229,7 @@ public partial class LibraryView : UserControl
             _ = CheckUpdatesAsync(manual: false);
         this.FindControl<Button>("BtnShare").Click += (_, _) => ToggleShare();
         this.FindControl<Button>("BtnPauseAll").Click += (_, _) => TogglePauseAll();
+        this.FindControl<Button>("BtnRetryFailed").Click += (_, _) => RetryFailedAll();
         this.FindControl<Button>("BtnClearDone").Click += (_, _) =>
         {
             // Finished rows go; stuck rows (sending/queued with no live
@@ -875,6 +879,30 @@ public partial class LibraryView : UserControl
         UpdateQueueLabel();
     }
 
+    /// <summary>
+    /// Restart all failed rows at once (issue #18): the same path as the
+    /// per-row ⟳ Reinstall, repeated for every failed row — no clicking
+    /// through a large batch one by one. Push order keeps the visual
+    /// order (rows are re-queued in reverse, each landing at the front).
+    /// Called on UI thread.
+    /// </summary>
+    private void RetryFailedAll()
+    {
+        List<QueueItem> failed;
+        lock (_runLock)
+        {
+            failed = _m.Queue.Where(q => q.State == "failed").ToList();
+        }
+        if (failed.Count == 0)
+        {
+            _m.Status = "Nothing to retry — no failed rows.";
+            return;
+        }
+        foreach (var row in Enumerable.Reverse(failed))
+            ResendRow(row);
+        _m.Status = $"Retrying {failed.Count} failed item(s)…";
+    }
+
     private TopLevel Top => TopLevel.GetTopLevel(this)!;
 
     private void Post(Action a) => Dispatcher.UIThread.Post(a);
@@ -917,11 +945,28 @@ public partial class LibraryView : UserControl
 
     private async Task AddFolderAsync(string title)
     {
-        var folders = await Top.StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
+        var storage = Top.StorageProvider;
+        var opts = new FolderPickerOpenOptions
         {
             Title = title,
             AllowMultiple = true,
-        });
+        };
+        // Reopen where the last pick happened (its parent folder) so big
+        // trees don't have to be scrolled through again (issue #18).
+        try
+        {
+            string? last = AppSettings.Load().LastPickFolder;
+            if (!string.IsNullOrEmpty(last) && Directory.Exists(last))
+            {
+                var start = await storage.TryGetFolderFromPathAsync(last);
+                if (start != null)
+                    opts.SuggestedStartLocation = start;
+            }
+        }
+        catch
+        {
+        }
+        var folders = await storage.OpenFolderPickerAsync(opts);
         var added = new List<string>();
         foreach (var f in folders)
         {
@@ -930,6 +975,25 @@ public partial class LibraryView : UserControl
             {
                 _roots.Add(p);
                 added.Add(p);
+            }
+        }
+        // Remember the browsing location (parent of the last pick) even
+        // when the folder was already in the list.
+        if (folders.Count > 0)
+        {
+            try
+            {
+                string last = folders[^1].Path.LocalPath;
+                string? where = Directory.GetParent(last)?.FullName ?? last;
+                if (Directory.Exists(where))
+                {
+                    var keep = AppSettings.Load();
+                    keep.LastPickFolder = where;
+                    keep.Save();
+                }
+            }
+            catch
+            {
             }
         }
         if (added.Count > 0)
@@ -1062,6 +1126,35 @@ public partial class LibraryView : UserControl
             return;
         }
         await ScanAsync(folders, merge: false);
+    }
+
+    /// <summary>
+    /// Fresh start (issue #18): drop every cached game AND all scan
+    /// folders/drives. Files on disk are untouched; the install queue
+    /// keeps running — only the library view + cache are wiped.
+    /// </summary>
+    private async Task ClearLibraryAsync()
+    {
+        var owner = Top as Window;
+        if (owner == null)
+            return;
+        int folders = _roots.Count(r => !IsDriveRoot(r));
+        int drives = _roots.Count - folders;
+        var dlg = new ConfirmDialog("Clear library?",
+            $"Removes all {_all.Count} cached entries and {folders} scan folder(s) / {drives} drive(s) from the list.\n" +
+            "Files on disk are not touched — add folders or drives and Scan to rebuild.\n" +
+            "Running installs keep going.",
+            okLabel: "Clear");
+        await dlg.ShowDialog(owner);
+        if (!dlg.Confirmed)
+            return;
+        _all.Clear();
+        _roots = new List<string>();
+        LibraryScanner.ClearCache();
+        _m.Search = "";
+        BumpLibraryVersion();
+        ImmediateFilter();
+        _m.Status = "Library cleared — add folders or drives for a fresh start.";
     }
 
     /// <summary>
@@ -1287,12 +1380,14 @@ public partial class LibraryView : UserControl
         string raw = (_m.Search ?? "").Trim();
         string pf = _m.PlatformFilter ?? "All";
         string sort = _m.SortMode ?? "Name";
-        bool hideExtras = _m.HideExtras;
+        bool hideGames = _m.HideGames;
+        bool hideUpdates = _m.HideUpdates;
+        bool hideDlcs = _m.HideDlcs;
         try { snapshot = _all.ToArray(); }
         catch { return; }
         // Repeat of the exact same view (e.g. Show all twice): skip the
         // GroupBy/sort entirely and re-apply the cached rows.
-        string key = $"{_allVersion}|{q}|{pf}|{sort}|{hideExtras}";
+        string key = $"{_allVersion}|{q}|{pf}|{sort}|{hideGames}|{hideUpdates}|{hideDlcs}";
         if (_filterCacheValid && key == _filterCacheKey)
         {
             var cached = _filterCache;
@@ -1304,7 +1399,7 @@ public partial class LibraryView : UserControl
             });
             return;
         }
-        var computed = await Task.Run(() => ComputeFiltered(snapshot, q, pf, sort, hideExtras));
+        var computed = await Task.Run(() => ComputeFiltered(snapshot, q, pf, sort, hideGames, hideUpdates, hideDlcs));
         if (gen != Volatile.Read(ref _filterGen))
             return; // superseded by newer input
         Post(() =>
@@ -1353,7 +1448,8 @@ public partial class LibraryView : UserControl
     }
 
     /// <summary>Pure filter+sort over a snapshot (background-thread safe).</summary>
-    private static (List<GameItem> Rows, (int Ps5, int Ps4, int Fams) Counts) ComputeFiltered(GameItem[] all, string q, string pf, string sort, bool hideExtras)
+    private static (List<GameItem> Rows, (int Ps5, int Ps4, int Fams) Counts) ComputeFiltered(
+        GameItem[] all, string q, string pf, string sort, bool hideGames, bool hideUpdates, bool hideDlcs)
     {
         int ps5 = 0, ps4 = 0;
         var famSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1372,35 +1468,21 @@ public partial class LibraryView : UserControl
             if (q.Length == 0 || g.SearchHay.Contains(q, StringComparison.Ordinal))
                 list.Add(g);
         }
-        // Hide DLC/updates mode: collapse each family to its base Game(s).
-        // Clicking 🔗 sets Search = FamilyKey -> exact family view, which
-        // bypasses the collapse so updates/DLCs become visible.
-        if (hideExtras)
+        // Per-kind hide filters (issue #18): games, updates and DLCs each
+        // hide on their own; images always stay. Family view (search ==
+        // family key, e.g. via the 🔗 chip) bypasses them so a family
+        // card click still shows everything that belongs together.
+        bool isFamilyView = q.Length > 0 &&
+            all.Any(a => string.Equals(a.FamilyKey.ToLowerInvariant(), q, StringComparison.Ordinal));
+        if (!isFamilyView && (hideGames || hideUpdates || hideDlcs))
         {
-            bool isFamilyView = q.Length > 0 &&
-                all.Any(a => string.Equals(a.FamilyKey.ToLowerInvariant(), q, StringComparison.Ordinal));
-            if (!isFamilyView)
+            list = list.Where(g => g.Role switch
             {
-                var collapsed = new List<GameItem>();
-                foreach (var grp in list.GroupBy(g => g.FamilyKey))
-                {
-                    if (grp.Key.StartsWith("FILE:", StringComparison.Ordinal))
-                    {
-                        collapsed.AddRange(grp);
-                        continue;
-                    }
-                    var bases = grp.Where(g => g.Role == "Game").ToList();
-                    var images = grp.Where(g => g.Role == "Image").ToList();
-                    if (bases.Count > 0)
-                    {
-                        collapsed.AddRange(bases);
-                        collapsed.AddRange(images); // images stay visible next to their game
-                    }
-                    else
-                        collapsed.AddRange(grp); // DLC-only family: nothing to collapse to
-                }
-                list = collapsed;
-            }
+                "Game" => !hideGames,
+                "Patch" => !hideUpdates,
+                "DLC" => !hideDlcs,
+                _ => true, // Image and anything else stays visible
+            }).ToList();
         }
         IEnumerable<GameItem> MemberOrder(IEnumerable<GameItem> ms) => ms
             .OrderBy(g => RoleRank(g.Role))
@@ -1462,6 +1544,10 @@ public partial class LibraryView : UserControl
             var b = this.FindControl<Button>("BtnPauseAll");
             if (b != null)
                 b.Content = label;
+            // Retry-failed lights up only when there is something to retry.
+            var rb = this.FindControl<Button>("BtnRetryFailed");
+            if (rb != null)
+                rb.IsEnabled = failed > 0;
         });
     }
 
